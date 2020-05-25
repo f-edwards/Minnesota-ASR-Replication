@@ -5,25 +5,186 @@ output: html_document
 
 ```{r setup, include=FALSE}
 library(tidyverse)
-dat<-read_csv("WA_dat.csv")
+library(lubridate)
+library(broom)
+library(knitr)
+library(lme4)
+
+opts_chunk$set(echo = F, warning = F, message = F)
+## inflation
+
+library(blscrapeR)
+infl<-inflation_adjust(base_year = 2018)
+  
+dat<-read_csv("WA_dat.csv") %>% 
+  mutate(year = year(case_file_date)) %>% 
+  mutate(birth_year = year(birth_date)) %>% 
+  mutate(birth_year = ifelse(birth_year<1900, NA, birth_year),
+         birth_year = ifelse(birth_year>2001, NA, birth_year)) %>% 
+  mutate(age = year - birth_year) %>% 
+  select(-case_file_date, -birth_date)
+
+### dropping missings for now
+
+dat<-dat %>% 
+  na.omit()
+
+### election data from https://doi.org/10.7910/DVN/VOQCHQ
+## pop data from https://seer.cancer.gov/popdata/yr1990_2018.19ages/wv.1990_2018.19ages.txt.gz
+
+votes<-read_csv("countypres_2000-2016.csv") %>% 
+  filter(state_po == "WA") %>% 
+  group_by(year, county, FIPS) %>% 
+  filter(!(is.na(party))) %>% 
+  summarise(pct_dem = sum(((party=="democrat") * candidatevotes)) / sum(((party=="democrat") * totalvotes)),
+            pct_rep = sum(((party=="republican") * candidatevotes)) / sum(((party=="republican") * totalvotes))) %>% 
+  ungroup() %>% 
+  mutate(election_year = year) %>% 
+  select(-year)
+
+### complete for off years
+years<-2000:2014
+county_fips<-votes %>% 
+  select(county, FIPS) %>% 
+  distinct()
+
+complete_votes<-data.frame(year = rep(years, each = nrow(county_fips)),
+                           county = county_fips$county,
+                           FIPS = county_fips$FIPS) %>% 
+  mutate(election_year = 
+           case_when(
+             year<2004 ~ 2000,
+             year<2008 ~ 2004,
+             year<2012 ~ 2008,
+             year<2016 ~ 2012,
+             year>=2016 ~ 2016
+           )) %>% 
+  left_join(votes)
+
+pop<-read_fwf("wa.1990_2018.19ages.txt",
+              fwf_widths(c(4, 2, 2, 3, 2, 1, 1, 1, 2, 8),
+                         c("year", "state", "st_fips",
+                           "cnty_fips", "reg", "race",
+                           "hisp", "sex", "age", "pop"))) %>% 
+  filter(year>=2000, year<=2014) %>% 
+  mutate(pop=as.numeric(pop)) %>% 
+  mutate(race_ethn =
+           case_when(
+             race==1 & hisp ==0 ~ "White",
+             race==2 ~ "Black",
+             race==3 ~ "AIAN",
+             race==4 ~ "API",
+             hisp==1 ~ "Hispanic")) %>% 
+  mutate(FIPS = paste(st_fips, cnty_fips, sep = "")) %>% 
+  select(-st_fips, -cnty_fips, -race, -hisp) %>% 
+  mutate(FIPS = as.numeric(FIPS)) %>% 
+  group_by(year, FIPS, race_ethn) %>% 
+  summarise(pop = sum(pop)) 
+
+pop<-pop %>% 
+  pivot_wider(names_from="race_ethn", values_from = "pop",
+              id_cols = c("year", "FIPS"), 
+              values_fill = list(pop = 0)) %>% 
+  mutate(Total = AIAN + API + Black + Hispanic + White) %>% 
+  mutate(prop_AIAN = AIAN/Total,
+         prop_API = API/Total,
+         prop_Black = Black/Total,
+         prop_Latinx = Hispanic/Total,
+         prop_White = White/Total) %>% 
+  select(year, FIPS, prop_AIAN, prop_API, prop_Black, prop_Latinx, prop_White,
+         Total)
+
+pop_votes<-pop %>% 
+  left_join(complete_votes) %>% 
+  rename(county_name = county)
+
+dat<-dat %>% 
+  left_join(pop_votes) %>% 
+  left_join(infl %>% 
+              select(year, adj_value) %>% 
+              mutate(year = as.numeric(year))) %>% 
+  mutate(ff_total = AR_ordered_amt/adj_value,
+         ff_adjusted = AR_adjusted/adj_value)
+
 ```
 
-## R Markdown
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+## Distribution of fines and fees vcxas
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+```{r}
+fel.mean <- dat %>% 
+  filter(ff_total<=2000) %>% 
+  summarise(mean_ff = mean(ff_total))
+  
 
-```{r cars}
-summary(cars)
+ggplot(dat %>% filter(ff_total<=2000), aes(x=ff_total)) + 
+  geom_histogram() +
+  labs(title = "Distribution of Fine and Fee Amount < $2000", x = "Total Fine/Fee Order ($)", y = "Frequency",
+       caption = "Note: Adjusted to Jan. 2018 dollars")+
+  theme_minimal()+
+  geom_vline(aes(xintercept = fel.mean$mean_ff), color="blue", linetype="dashed")
 ```
 
-## Including Plots
 
-You can also embed plots, for example:
+## Table 3
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+```{r }
+### add 1 for log outcome
+
+dat<-dat %>% 
+  mutate(ff_total = ifelse(ff_total==0, 1, ff_total))
+
+m1<-lmer(log(ff_total) ~ race.ethn + Violent + 
+         Drugs + DUI + trial + log(age) + priors + 
+         prop_White + pct_rep + 
+           (1|county_name),
+       data = dat)
+
+kable(tidy(m1), digits = 2)
+
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+## Table 4
+
+```{r }
+### add 1 for log outcome
+
+m2<-lmer(log(ff_total) ~ race.ethn * Violent + 
+           Drugs + DUI + trial + log(age) + priors + 
+           prop_Black + pct_rep  +
+           (1|county_name),
+         data = dat)
+
+kable(tidy(m2), digits = 2)
+
+```
+
+## Table 5
+
+```{r }
+### add 1 for log outcome
+
+m3<-lmer(log(ff_total) ~ race.ethn * Drugs + 
+           Drugs + DUI + trial + log(age) + priors + 
+           prop_Black + pct_rep  +
+           (1|county_name),
+         data = dat)
+
+kable(tidy(m3), digits = 2)
+
+```
+
+## Table 6
+
+```{r }
+### add 1 for log outcome
+
+m3<-lmer(log(ff_total) ~ race.ethn * DUI + 
+           Drugs + DUI + trial + log(age) + priors + 
+           prop_Black + pct_rep  +
+           (1|county_name),
+         data = dat)
+
+kable(tidy(m3), digits = 2)
+
+```

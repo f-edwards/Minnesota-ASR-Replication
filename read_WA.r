@@ -18,6 +18,9 @@ sup_sentence<-fread("2_Superior_Case_Sentence.txt",
                     data.table=FALSE)
 
 priors<-read_delim("4_Prior_Convictions_Sentences.txt", delim="|")
+priors_count<-priors %>% 
+  group_by(actor_key) %>% 
+  summarise(priors = n())
 
 sup_costs<-fread("7_SUPERIOR_Costs.txt", 
                  fill=TRUE,sep="|", quote='', 
@@ -126,6 +129,10 @@ charge_desc<-charge_desc %>%
 dat_out<-sup_costs %>% 
   left_join(charge_desc) %>% 
   left_join(demo) %>% 
-  left_join(sup_sentence)
+  left_join(sup_sentence) %>% 
+  left_join(priors_count) %>% 
+  mutate(priors = 
+           ifelse(is.na(priors), 0,
+                  priors))
 
 write_csv(dat_out, "~/win/project/LFO/Data Collection/WA/fe_scripts/Minnesota-ASR-Replication/WA_dat.csv")
